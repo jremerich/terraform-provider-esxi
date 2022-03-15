@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"crypto/sha1"
+	"crypto/tls"
 )
 
 func execCommand(cmd string) *exec.Cmd {
@@ -66,8 +68,34 @@ func canUsePullUploadMode(c *Config) bool {
 	}
 
 	constraintsOvftool, err := version.NewConstraint(">= 4.4.1")
-	constraintsEsxi, err := version.NewConstraint(">= 6.7, <= 7.0")
+	constraintsEsxi, err := version.NewConstraint(">= 6.7")
 	return constraintsOvftool.Check(actualVersion) && constraintsEsxi.Check(actualEsxiVersion)
+}
+
+func getOVASSLFingerprint(p string) string {
+	u, err := url.Parse(p)
+	// host, port, _ := net.SplitHostPort(u.Host)
+
+	conn, err := tls.Dial("tcp", u.Host, &tls.Config{})
+	if err != nil {
+		panic("failed to connect: " + err.Error())
+	}
+
+	// Get the ConnectionState struct as that's the one which gives us x509.Certificate struct
+	cert := conn.ConnectionState().PeerCertificates[0]
+	fingerprint := sha1.Sum(cert.Raw)
+
+	var buf bytes.Buffer
+	for i, f := range fingerprint {
+		if i > 0 {
+			fmt.Fprintf(&buf, ":")
+		}
+		fmt.Fprintf(&buf, "%02X", f)
+	}
+	fmt.Printf("Fingerprint for %s: %s", u.Host, buf.String())
+	conn.Close()
+
+	return buf.String()
 }
 
 func guestCREATE(c *Config, guest_name string, disk_store string,
@@ -80,7 +108,7 @@ func guestCREATE(c *Config, guest_name string, disk_store string,
 	log.Printf("[guestCREATE]\n")
 
 	var memsize, numvcpus, virthwver int
-	var boot_disk_vmdkPATH, remote_cmd, vmid, stdout, vmx_contents, pull_upload_mode string
+	var boot_disk_vmdkPATH, remote_cmd, vmid, stdout, vmx_contents, pull_upload_mode, fingerprint, fingerprint_param string
 	var out bytes.Buffer
 	var err error
 	var is_ovf_properties bool
@@ -273,6 +301,7 @@ func guestCREATE(c *Config, guest_name string, disk_store string,
 				defer resp.Body.Close()
 			} else {
 				pull_upload_mode = "--pullUploadMode "
+				fingerprint = getOVASSLFingerprint(src_path);
 			}
 		} else if strings.HasPrefix(src_path, "vi://") {
 			log.Printf("[guestCREATE] Source is Guest VM (vi).\n")
@@ -312,8 +341,12 @@ func guestCREATE(c *Config, guest_name string, disk_store string,
 			log.Println("[guestCREATE] ovf_properties extra_params: " + extra_params)
 		}
 
+		if(len(fingerprint) > 0) {
+			fingerprint_param = " --sourceSSLThumbprint='"+fingerprint+"' "
+		}
+
 		ovf_cmd := fmt.Sprintf("ovftool --acceptAllEulas --noSSLVerify --X:useMacNaming=false %s "+
-			"-dm=%s --name='%s' --overwrite -ds='%s' %s %s'%s' '%s'", extra_params, boot_disk_type, guest_name, disk_store, net_param, pull_upload_mode, src_path, dst_path)
+			"-dm=%s --name='%s' --overwrite -ds='%s' %s %s %s'%s' '%s'", extra_params, boot_disk_type, guest_name, disk_store, net_param, pull_upload_mode, fingerprint_param, src_path, dst_path)
 
 		if runtime.GOOS == "windows" {
 			ovf_cmd = strings.Replace(ovf_cmd, "'", "\"", -1)
